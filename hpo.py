@@ -1,5 +1,7 @@
 #TODO: Import your dependencies.
 #For instance, below are some dependencies you might need if you are using Pytorch
+
+import s3fs
 import numpy as np
 import torch
 import torch.nn as nn
@@ -7,14 +9,13 @@ import torch.optim as optim
 import torchvision
 import torchvision.models as models
 import torchvision.transforms as transforms
+import argparse
 
 import os
 import io
-import s3fs
+
 from torch.utils.data import DataLoader, Dataset
 from PIL import Image
-
-import argparse
 
 class S3ImageDataset(Dataset):
     """
@@ -24,14 +25,26 @@ class S3ImageDataset(Dataset):
         3 - using `from torch.utils.data import Dataset` and create our own Dataset streaming directly from S3
         I would like to test 3er approach and thats the reason of this class
     """
-    def __init__(self, s3_bucket, prefix):
+    def __init__(self, s3_bucket, prefix, mode="training"):
         self.s3 = s3fs.S3FileSystem()
         self.s3_bucket = s3_bucket
         self.prefix = prefix
-        self.transform = transforms.Compose([
-            transforms.Resize((224, 224)),  # pretrained modules are ussually 224x224 size
-            transforms.ToTensor()           # Convert images to PyTorch tensors
-        ])
+        
+        # Define transformations with different behavior for training/testing
+        if mode == "training":
+            self.transform = transforms.Compose([
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomRotation(10),
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+            ])
+        else:  # For testing or validation
+            self.transform = transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+            ])
 
         self.files = self.s3.glob(f'{self.s3_bucket}/{self.prefix}/*/*.jpg')
         
@@ -42,7 +55,7 @@ class S3ImageDataset(Dataset):
             # print("about to check: " + file.split('/')[-2])
             idx, cls = (file.split('/')[-2]).split('.')
             if cls not in self.class_to_idx:
-                self.class_to_idx[cls] = int(idx)
+                self.class_to_idx[cls] = int(idx) - 1
                 self.classes.append(cls)
 
     def __len__(self):
@@ -51,135 +64,114 @@ class S3ImageDataset(Dataset):
     def __getitem__(self, index):
         file_path = self.files[index]
 
-        with self.s3.open(file_path, 'rb') as f:
-            image = Image.open(io.BytesIO(f.read())).convert('RGB')
+        try:
+            with self.s3.open(file_path, 'rb') as f:
+                image = Image.open(io.BytesIO(f.read())).convert('RGB')
+            if self.transform:
+                image = self.transform(image)
 
-        # By defualt we are using `transforms.ToTensor()`
-        #   default_collate: batch must contain tensors, numpy arrays, numbers, dicts or lists; found <class 'PIL.Image.Image'>
-        #  and transforms.Resize as Images have multiples sizes
+            directory = file_path.split('/')[-2]
+            idx, cls = directory.split('.')
+            label = int(idx) - 1  # Adjust to zero-indexing if needed
+            return image, torch.tensor(label)
 
-        if self.transform:
-            image = self.transform(image)
+        except (OSError, IOError) as e:
+            print(f"Warning: Skipping corrupted image at {file_path} - {e}")
+            return self.__getitem__((index + 1) % len(self.files))
 
-        directory = file_path.split('/')[-2]
-        idx, cls = directory.split('.')
-        label = int(idx)
+def initialize_weights(m):
+    if isinstance(m, nn.Linear):
+        nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
 
-        return image, label
-
-
-def test(model, test_loader):
-    '''
-    TODO: Complete this function that can take a model and a 
-          testing data loader and will get the test accuray/loss of the model
-          Remember to include any debugging/profiling hooks that you might need
-    '''
-    device = 'cuda' if tourch.cuda.is_available() else 'cpu'
-    print(f'Using device: {device}')
-
-    model.to(device)
+def test(model, test_loader, criterion):
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model.eval()
+    total_loss = 0.0
+    correct = 0
+    total_samples = 0
 
-
-
-def test(model, test_loader):
-    '''
-    TODO: Complete this function that can take a model and a 
-          testing data loader and will get the test accuray/loss of the model
-          Remember to include any debugging/profiling hooks that you might need
-    '''
-    device = 'cuda' if tourch.cuda.is_available() else 'cpu'
-    print(f'Using device: {device}')
-
-    model.eval()
     with torch.no_grad():
         for inputs, labels in test_loader:
-            # Move inputs and labels to the device
             inputs, labels = inputs.to(device), labels.to(device)
-            
-            # Forward pass
             outputs = model(inputs)
-            
-            # Compute the loss
             loss = criterion(outputs, labels)
-            total_loss += loss.item()
-
-            # Get the predicted class with the highest score
+            total_loss += loss.item() * inputs.size(0)  # Multiply by batch size
             _, predicted = torch.max(outputs, 1)
             correct += (predicted == labels).sum().item()
             total_samples += labels.size(0)
-    
-    # Average loss and accuracy
-    avg_loss = total_loss / len(test_loader)
+
+    avg_loss = total_loss / total_samples
     accuracy = 100.0 * correct / total_samples
 
     print(f"Test Loss: {avg_loss:.4f}, Test Accuracy: {accuracy:.2f}%")
-    
     return avg_loss, accuracy
 
-
-def train(model, train_loader, criterion, optimizer):
-    '''
-    TODO: Complete this function that can take a model and
-          data loaders for training and will get train the model
-          Remember to include any debugging/profiling hooks that you might need
-    '''
-    # Check for GPU availability
+def train(model, train_loader, criterion, optimizer, epochs=1):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f'Using device: {device}')
-
     model.to(device)
     model.train()
-    total_loss = 0.0
-    total_batches = len(train_loader)
 
-    for batch_idx, (inputs, labels) in enumerate(train_loader):
-        # print(f"{batch_idx=}, {inputs=} and {labels=}")
-        optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
+    for epoch in range(epochs):
+        total_loss = 0.0
+        total_samples = 0
+        print(f'Starting Epoch {epoch + 1}/{epochs}')
 
-        # Print progress every 10 batches (you can change this)
-        if batch_idx % 10 == 0:
-            print(f'Batch {batch_idx}/{total_batches}, Loss: {loss.item():.4f}')
+        for batch_idx, (inputs, labels) in enumerate(train_loader):
+            inputs, labels = inputs.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            
+            # Apply gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.fc.parameters(), max_norm=2.0)
 
-        # Calculate the average loss over all batches in the epoch
-        avg_loss = total_loss / total_batches
-        print(f'model trained with {avg_loss=}')
+            optimizer.step()
+            total_loss += loss.item() * inputs.size(0)
+            total_samples += inputs.size(0)
 
-        return model
-    
-def net():
-    '''
-    TODO: Complete this function that initializes your model
-          Remember to use a pretrained model
-    '''
-    # there are 49 types of dogs in the training data
-    # for now, lets keep it hard coded, we might want it
-    # parametized????....
-    # it seems num_class needs to be indexed starting 0 so, I hace 49 classes
-    # but, its complaining about the class 49, I assume, it expect starting 0
-    num_classes = 50
+            if batch_idx % 10 == 0:
+                print(f'Batch {batch_idx}/{len(train_loader)}, Loss: {loss.item():.4f}')
 
-    model = models.resnet18(pretrained=True)
-
-    for param in model.parameters():
-        param.requires_grad = False
-
-    num_features = model.fc.in_features
-    model.fc = nn.Linear(num_features, num_classes)
+        avg_loss = total_loss / total_samples
+        print(f'Epoch {epoch + 1} completed. Average Loss: {avg_loss:.4f}')
 
     return model
 
-def create_data_loaders(source, batch_size=None):
+def net():
+    num_classes = 133
+    model = models.resnet18(pretrained=True)
+
+    # Freeze all layers
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # Modify the final layer for the new number of classes
+    num_features = model.fc.in_features
+    model.fc = nn.Sequential(
+        nn.Linear(num_features, 512),  # Intermediate layer
+        nn.ReLU(),
+        nn.Dropout(0.3),
+        nn.Linear(512, num_classes)    # Output layer
+    )
+
+    # Make only the final layer trainable
+    for param in model.fc.parameters():
+        param.requires_grad = True
+
+    # Apply weight initialization to the new layers in `fc`
+    model.fc.apply(initialize_weights)
+
+    return model
+
+def create_data_loaders(source, batch_size=None, mode="training"):
     '''
     This is an optional function that you may or may not need to implement
     depending on whether you need to use data loaders or not
     '''
-    dataset = S3ImageDataset(s3_bucket='legc-deep-learning', prefix=source)
+    dataset = S3ImageDataset(s3_bucket='legc-deep-learning', prefix=source, mode=mode)
     return DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
 def main(args):
@@ -195,28 +187,28 @@ def main(args):
     optimizer = None
     # let check for the parameters
     if args.optimizer == 'adam':
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+        optimizer = torch.optim.Adam(model.fc.parameters(), lr=args.learning_rate)
     else: #should be sgd, otherwise an error will be trigged
-        optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate, momentum=args.momentum)
+        optimizer = torch.optim.SGD(model.fc.parameters(), lr=args.learning_rate, momentum=args.momentum)
     
     '''
     TODO: Call the train function to start training your model
     Remember that you will need to set up a way to get training data from S3
     '''
-    train_loader = create_data_loaders(source='train', batch_size=None if args.train_batch_size == -1 else args.train_batch_size)
+    train_loader = create_data_loaders(source='train', batch_size=1 if args.train_batch_size == None else args.train_batch_size, mode="training")
     loss_criterion = nn.CrossEntropyLoss()
-    model=train(model, train_loader, loss_criterion, optimizer)
+    model=train(model, train_loader, loss_criterion, optimizer, args.epochs)
     
-    '''
-    TODO: Test the model to see its accuracy
-    '''
-    # test_loader = create_data_loaders(source='test', batch_size=None if args.test_batch_size == -1 else args.test_batch_size)
-    # test(model, test_loader, criterion)
+    # '''
+    # TODO: Test the model to see its accuracy
+    # '''
+    test_loader = create_data_loaders(source='test', batch_size=1 if args.test_batch_size == None else args.test_batch_size, mode="testing")
+    test(model, test_loader, loss_criterion)
     
     '''
     TODO: Save the trained model
     '''
-    torch.save(model, args.path_to_save)
+    torch.save(model.state_dict(), os.path.join(os.environ["SM_MODEL_DIR"], "model.pth"))
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser()
@@ -234,7 +226,7 @@ if __name__=='__main__':
     parser.add_argument(
         '--test_batch_size',
         type=int,
-        default=-1,
+        default=1,
         help='test batch size input for training (default: None)'
     )
 
@@ -265,13 +257,6 @@ if __name__=='__main__':
         type=float,
         default=0.9,
         help="Momentum for SGD if selected (defualt 0.9)"
-    )
-
-    parser.add_argument(
-        '--path_to_save',
-        type=str,
-        default='/tmp/default_output_model',
-        help="output model path (default /tmp/default_output_model)"
     )
 
     args=parser.parse_args()
